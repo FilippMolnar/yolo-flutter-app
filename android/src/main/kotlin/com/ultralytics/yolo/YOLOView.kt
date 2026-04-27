@@ -548,11 +548,11 @@ class YOLOView @JvmOverloads constructor(
                         .setResolutionSelector(previewResolutionSelector)
                         .build()
 
-                    // ImageAnalysis at 640×480 (4:3) so YOLO inference stays ~30ms.
-                    // NV21 frames for RTMP are extracted at this resolution.
+                    // ImageAnalysis at 16:9 so YOLO inference stays fast and RTMP
+                    // frames match the preview aspect ratio. CameraX picks ~1280×720.
                     imageAnalysisUseCase = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                         .build()
 
                     cameraExecutor = Executors.newSingleThreadExecutor()
