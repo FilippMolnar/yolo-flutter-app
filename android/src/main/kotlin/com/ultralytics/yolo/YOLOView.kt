@@ -31,8 +31,6 @@ import android.view.Gravity
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import android.content.res.Configuration
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
 
 class YOLOView @JvmOverloads constructor(
     context: Context,
@@ -534,25 +532,13 @@ class YOLOView @JvmOverloads constructor(
                 try {
                     val cameraProvider = cameraProviderFuture.get()
 
-                    // Preview at 1080p for display quality.
-                    val previewResolutionSelector = ResolutionSelector.Builder()
-                        .setResolutionStrategy(
-                            ResolutionStrategy(
-                                android.util.Size(1920, 1080),
-                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
-                            )
-                        )
-                        .build()
-
                     previewUseCase = Preview.Builder()
-                        .setResolutionSelector(previewResolutionSelector)
+                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                         .build()
 
-                    // ImageAnalysis at 16:9 so YOLO inference stays fast and RTMP
-                    // frames match the preview aspect ratio. CameraX picks ~1280×720.
                     imageAnalysisUseCase = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                         .build()
 
                     cameraExecutor = Executors.newSingleThreadExecutor()
