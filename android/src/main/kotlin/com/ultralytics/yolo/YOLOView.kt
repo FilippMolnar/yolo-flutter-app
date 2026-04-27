@@ -534,7 +534,8 @@ class YOLOView @JvmOverloads constructor(
                 try {
                     val cameraProvider = cameraProviderFuture.get()
 
-                    val resolutionSelector = ResolutionSelector.Builder()
+                    // Preview at 1080p for display quality.
+                    val previewResolutionSelector = ResolutionSelector.Builder()
                         .setResolutionStrategy(
                             ResolutionStrategy(
                                 android.util.Size(1920, 1080),
@@ -544,12 +545,14 @@ class YOLOView @JvmOverloads constructor(
                         .build()
 
                     previewUseCase = Preview.Builder()
-                        .setResolutionSelector(resolutionSelector)
+                        .setResolutionSelector(previewResolutionSelector)
                         .build()
 
+                    // ImageAnalysis at 640×480 (4:3) so YOLO inference stays ~30ms.
+                    // NV21 frames for RTMP are extracted at this resolution.
                     imageAnalysisUseCase = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setResolutionSelector(resolutionSelector)
+                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                         .build()
 
                     cameraExecutor = Executors.newSingleThreadExecutor()
