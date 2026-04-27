@@ -179,6 +179,15 @@ class YOLOPlatformViewFactory(
         methodChannel.setMethodCallHandler(platformView)
 
         activeViews[viewId] = platformView
+
+        val rtmpChannelName = "com.ultralytics.yolo/rtmpFrames_$viewUniqueId"
+        EventChannel(messenger, rtmpChannelName).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(args: Any?, sink: EventChannel.EventSink?) {
+                platformView.rtmpSink = sink
+            }
+            override fun onCancel(args: Any?) { platformView.rtmpSink = null }
+        })
+
         return platformView
     }
 

@@ -9,6 +9,11 @@ class ChannelConfig {
       'com.ultralytics.yolo/controlChannel_';
   static const String detectionResultsPrefix =
       'com.ultralytics.yolo/detectionResults_';
+  static const String rtmpFramesPrefix = 'com.ultralytics.yolo/rtmpFrames_';
+
+  /// Event channel that streams NV21 frames for RTMP export.
+  static EventChannel createRtmpFramesChannel(String viewId) =>
+      EventChannel('$rtmpFramesPrefix$viewId');
 
   /// Creates a method channel, suffixed with [instanceId] unless it is the
   /// `default` (single-instance) sentinel.

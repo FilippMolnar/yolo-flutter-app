@@ -1,6 +1,7 @@
 // Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -36,6 +37,7 @@ class YOLOView extends StatefulWidget {
   final bool showOverlays;
   final YOLOOverlayTheme overlayTheme;
   final LensFacing lensFacing;
+  final void Function(Uint8List nv21, int width, int height)? onRtmpFrame;
 
   const YOLOView({
     super.key,
@@ -55,6 +57,7 @@ class YOLOView extends StatefulWidget {
     this.showOverlays = true,
     this.overlayTheme = const YOLOOverlayTheme(),
     this.lensFacing = LensFacing.back,
+    this.onRtmpFrame,
   });
 
   @override
@@ -66,6 +69,7 @@ class _YOLOViewState extends State<YOLOView> {
   late MethodChannel _methodChannel;
   late EventChannel _resultEventChannel;
   StreamSubscription<dynamic>? _resultSubscription;
+  StreamSubscription<dynamic>? _rtmpSubscription;
   YOLOResolvedModel? _resolvedModel;
   Object? _resolutionError;
   int _resolutionRequestId = 0;
@@ -297,6 +301,7 @@ class _YOLOViewState extends State<YOLOView> {
   void dispose() {
     _effectiveController.stop();
     _resultSubscription?.cancel();
+    _rtmpSubscription?.cancel();
     _methodChannel.setMethodCallHandler(null);
 
     if (_platformViewId != null) {
@@ -430,6 +435,20 @@ class _YOLOViewState extends State<YOLOView> {
         widget.onStreamingData != null) {
       _subscribeToResults();
     }
+
+    if (widget.onRtmpFrame != null) {
+      _rtmpSubscription = ChannelConfig.createRtmpFramesChannel(_viewId)
+          .receiveBroadcastStream()
+          .listen(_handleRtmpFrame, onError: (_) {});
+    }
+  }
+
+  void _handleRtmpFrame(dynamic event) {
+    if (event is! Map) return;
+    final nv21 = event['nv21'] as Uint8List?;
+    final w = (event['width'] as num?)?.toInt() ?? 0;
+    final h = (event['height'] as num?)?.toInt() ?? 0;
+    if (nv21 != null && w > 0 && h > 0) widget.onRtmpFrame!(nv21, w, h);
   }
 
   Future<dynamic> _handleMethodCall(MethodCall call) async {

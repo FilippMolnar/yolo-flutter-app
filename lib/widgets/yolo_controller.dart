@@ -130,5 +130,8 @@ class YOLOViewController {
   Future<void> setShowOverlays(bool show) =>
       _invoke('setShowOverlays', {'show': show});
 
+  Future<void> setRtmpEnabled(bool enabled) =>
+      _invoke('setRtmpEnabled', {'enabled': enabled});
+
   Future<Uint8List?> captureFrame() => _invoke<Uint8List>('captureFrame');
 }

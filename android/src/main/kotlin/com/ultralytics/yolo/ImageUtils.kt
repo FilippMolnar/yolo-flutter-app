@@ -96,7 +96,7 @@ object ImageUtils {
     }
 
 
-    private fun yuv420888ToNv21(imageProxy: ImageProxy): ByteArray {
+    internal fun yuv420888ToNv21(imageProxy: ImageProxy): ByteArray {
         val cropRect = imageProxy.cropRect
         val pixelCount = cropRect.width() * cropRect.height()
         val pixelSizeBits = ImageFormat.getBitsPerPixel(ImageFormat.YUV_420_888)

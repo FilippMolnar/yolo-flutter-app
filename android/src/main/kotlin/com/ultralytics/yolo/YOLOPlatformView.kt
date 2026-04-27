@@ -34,6 +34,9 @@ class YOLOPlatformView(
     
     // Track if we're actively streaming
     private val isStreaming = AtomicBoolean(false)
+
+    // RTMP frame sink
+    @Volatile var rtmpSink: EventChannel.EventSink? = null
     
     // Store last event to resend after reconnection
     @Volatile
@@ -127,7 +130,17 @@ class YOLOPlatformView(
             // Load model
             val useGpu = creationParams?.get("useGpu") as? Boolean ?: true
             yoloView.setModel(modelPath, task, useGpu)
-            
+
+            yoloView.setRtmpFrameCallback { nv21, w, h ->
+                val sink = rtmpSink
+                if (sink != null) {
+                    retryHandler.post {
+                        try { sink.success(mapOf("nv21" to nv21, "width" to w, "height" to h)) }
+                        catch (e: Exception) {}
+                    }
+                }
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing YOLOPlatformView", e)
         }
@@ -442,6 +455,11 @@ class YOLOPlatformView(
                     yoloView.setShowUIControls(show)
                     result.success(null)
                 }
+                "setRtmpEnabled" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    yoloView.setRtmpEnabled(enabled)
+                    result.success(null)
+                }
                 else -> {
                     result.notImplemented()
                 }
@@ -463,6 +481,7 @@ class YOLOPlatformView(
             yoloView.stop()
             // Clear callbacks by setting them to empty implementations
             yoloView.setStreamCallback { }
+            yoloView.setRtmpFrameCallback(null)
             yoloView.setOnInferenceCallback { }
             yoloView.setOnModelLoadCallback { }
         } catch (e: Exception) {

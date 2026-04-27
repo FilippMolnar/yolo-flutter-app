@@ -31,6 +31,8 @@ import android.view.Gravity
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit
 import android.content.res.Configuration
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 
 class YOLOView @JvmOverloads constructor(
     context: Context,
@@ -206,7 +208,13 @@ class YOLOView @JvmOverloads constructor(
     
     // Flag to track if the view is stopped/disposed to prevent race conditions
     @Volatile
-    private var isStopped = false    
+    private var isStopped = false
+
+    // RTMP frame export
+    @Volatile private var rtmpEnabled = false
+    private var lastRtmpMs = 0L
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var rtmpFrameCallback: ((ByteArray, Int, Int) -> Unit)? = null
 
     // Zoom related
     private var currentZoomRatio = 1.0f
@@ -365,7 +373,10 @@ class YOLOView @JvmOverloads constructor(
     fun setShowOverlays(show: Boolean) {
         showOverlays = show
     }
-    
+
+    fun setRtmpEnabled(enabled: Boolean) { rtmpEnabled = enabled }
+    fun setRtmpFrameCallback(cb: ((ByteArray, Int, Int) -> Unit)?) { rtmpFrameCallback = cb }
+
     fun setShowUIControls(show: Boolean) {
         showUIControls = show
         // Show/hide all UI controls
@@ -523,13 +534,22 @@ class YOLOView @JvmOverloads constructor(
                 try {
                     val cameraProvider = cameraProviderFuture.get()
 
+                    val resolutionSelector = ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                android.util.Size(1920, 1080),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                            )
+                        )
+                        .build()
+
                     previewUseCase = Preview.Builder()
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(resolutionSelector)
                         .build()
 
                     imageAnalysisUseCase = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(resolutionSelector)
                         .build()
 
                     cameraExecutor = Executors.newSingleThreadExecutor()
@@ -649,6 +669,21 @@ class YOLOView @JvmOverloads constructor(
         if (isStopped) {
             imageProxy.close()
             return
+        }
+
+        // NV21 export for RTMP streaming at ≤30fps
+        if (rtmpEnabled) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastRtmpMs >= 33) {
+                lastRtmpMs = nowMs
+                try {
+                    val nv21 = ImageUtils.yuv420888ToNv21(imageProxy)
+                    val fw = imageProxy.width
+                    val fh = imageProxy.height
+                    val cb = rtmpFrameCallback
+                    if (cb != null) mainHandler.post { cb(nv21, fw, fh) }
+                } catch (e: Exception) {}
+            }
         }
 
         predictor?.let { p ->
