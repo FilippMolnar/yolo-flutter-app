@@ -23,14 +23,26 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import com.google.common.util.concurrent.ListenableFuture
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
+import java.io.ByteArrayOutputStream
+import android.graphics.YuvImage
+import android.graphics.Rect as GraphicsRect
 import kotlin.math.max
 import kotlin.math.min
 import android.widget.TextView
 import android.view.Gravity
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.TimeUnit
 import android.content.res.Configuration
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
 
 class YOLOView @JvmOverloads constructor(
     context: Context,
@@ -46,6 +58,7 @@ class YOLOView @JvmOverloads constructor(
         private var previewUseCase: Preview? = null
 
         private const val TAG = "YOLOView"
+        const val UDP_CHUNK_SIZE = 1400
 
         // Line thickness and corner radius
         private const val BOX_LINE_WIDTH = 8f
@@ -144,7 +157,7 @@ class YOLOView @JvmOverloads constructor(
     private var streamCallback: ((Map<String, Any>) -> Unit)? = null
     
     // Frame counter for streaming
-    private var frameNumberCounter: Long = 0
+    private val frameNumberCounter = AtomicLong(0)
     
     // Throttling variables for performance control
     private var lastInferenceTime: Long = 0
@@ -191,7 +204,7 @@ class YOLOView @JvmOverloads constructor(
     private val overlayView: OverlayView = OverlayView(context)
 
     private var inferenceResult: YOLOResult? = null
-    private var predictor: Predictor? = null
+    @Volatile private var predictor: Predictor? = null
     private var task: YOLOTask = YOLOTask.DETECT
     private var modelName: String = "Model"
 
@@ -213,6 +226,27 @@ class YOLOView @JvmOverloads constructor(
     private var lastRtmpMs = 0L
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var rtmpFrameCallback: ((ByteArray, Int, Int) -> Unit)? = null
+
+    // UDP streaming — H.264 hardware-encoded via MediaCodec
+    @Volatile private var udpTarget: InetSocketAddress? = null
+    private var udpSocket: DatagramSocket? = null
+    private val udpFrameSeq = AtomicInteger(0)
+    @Volatile private var udpPipelineRunning = false
+    @Volatile private var mediaCodec: MediaCodec? = null
+    @Volatile private var h264OutputRunning = false
+    private var h264OutputThread: Thread? = null
+    @Volatile private var codecConfigData: ByteArray? = null  // SPS+PPS, prepended to every IDR
+    private var nv12ScratchBuffer: ByteArray? = null  // reused per-frame to avoid allocation
+    private val h264DroppedFrames = AtomicInteger(0)
+    private val h264SubmittedFrames = AtomicInteger(0)
+    private val cameraFrameCounter = AtomicInteger(0)
+    @Volatile private var cameraTickMs = 0L
+
+    // Async inference — YOLO runs on its own thread so it doesn't block frame capture
+    // Queue carries raw NV21 bytes so bitmap decoding happens off the camera thread
+    private val inferenceQueue = ArrayBlockingQueue<Triple<ByteArray, Int, Int>>(1)
+    @Volatile private var inferenceThreadRunning = false
+    private var inferenceThread: Thread? = null
 
     // Zoom related
     private var currentZoomRatio = 1.0f
@@ -375,6 +409,231 @@ class YOLOView @JvmOverloads constructor(
     fun setRtmpEnabled(enabled: Boolean) { rtmpEnabled = enabled }
     fun setRtmpFrameCallback(cb: ((ByteArray, Int, Int) -> Unit)?) { rtmpFrameCallback = cb }
 
+    fun setUdpTarget(host: String, port: Int, quality: Int = 40) {
+        udpTarget = InetSocketAddress(host, port)
+        if (!udpPipelineRunning) startUdpPipeline()
+    }
+
+    fun clearUdpTarget() {
+        udpTarget = null
+        stopUdpPipeline()
+    }
+
+    private fun startUdpPipeline() {
+        udpPipelineRunning = true
+        udpSocket = DatagramSocket()
+        // H.264 encoder is started lazily on first frame (dimensions needed)
+    }
+
+    private fun startInferenceThread() {
+        inferenceThreadRunning = true
+        inferenceThread = Thread {
+            while (inferenceThreadRunning) {
+                val frame = inferenceQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                val (nv21, w, h) = frame
+                val p = predictor
+                if (p == null || isStopped) continue
+                try {
+                    // Bitmap decode happens here, off the camera thread
+                    val t0 = System.currentTimeMillis()
+                    val bitmap = ImageUtils.toBitmapFromNv21(nv21, w, h) ?: continue
+                    val decodeMs = System.currentTimeMillis() - t0
+
+                    val isLandscape = context.resources.configuration.orientation ==
+                        android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                    val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
+                    (p as? BasePredictor)?.isFrontCamera = isFrontCamera
+
+                    val t1 = System.currentTimeMillis()
+                    val result = if (isLandscape) {
+                        p.predict(bitmap, w, h, rotateForCamera = true, isLandscape = isLandscape)
+                    } else {
+                        p.predict(bitmap, h, w, rotateForCamera = true, isLandscape = isLandscape)
+                    }
+                    val yoloMs = System.currentTimeMillis() - t1
+                    Log.d(TAG, "inference: decode=${decodeMs}ms yolo=${yoloMs}ms total=${decodeMs+yoloMs}ms")
+
+                    val resultWithOriginalImage = if (streamConfig?.includeOriginalImage == true) {
+                        result.copy(originalImage = bitmap)
+                    } else {
+                        result
+                    }
+
+                    inferenceResult = resultWithOriginalImage
+                    inferenceCallback?.invoke(resultWithOriginalImage)
+
+                    streamCallback?.let { callback ->
+                        if (shouldProcessFrame()) {
+                            updateLastInferenceTime()
+                            val streamData = convertResultToStreamData(resultWithOriginalImage)
+                            val enhancedStreamData = HashMap<String, Any>(streamData)
+                            enhancedStreamData["timestamp"] = System.currentTimeMillis()
+                            enhancedStreamData["frameNumber"] = frameNumberCounter.getAndIncrement()
+                            callback.invoke(enhancedStreamData)
+                        }
+                    }
+
+                    post { overlayView.invalidate() }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during inference", e)
+                }
+            }
+        }.also { it.isDaemon = true; it.name = "yolo-inference"; it.start() }
+    }
+
+    private fun stopInferenceThread() {
+        inferenceThreadRunning = false
+        inferenceThread?.join(500)
+        inferenceThread = null
+        inferenceQueue.clear()
+    }
+
+    private fun stopUdpPipeline() {
+        udpPipelineRunning = false
+        stopH264Encoder()
+        udpSocket?.close()
+        udpSocket = null
+    }
+
+    private fun startH264Encoder(w: Int, h: Int) {
+        try {
+            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+                setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            }
+            // Sync mode (no setCallback) so dequeueInputBuffer() works in feedH264Frame()
+            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+            mediaCodec = codec
+            Log.i(TAG, "H264 hardware encoder started ${w}x${h}")
+
+            // Drain output on a dedicated thread
+            h264OutputRunning = true
+            h264OutputThread = Thread {
+                val info = MediaCodec.BufferInfo()
+                while (h264OutputRunning) {
+                    val mc = mediaCodec ?: break
+                    val idx = try { mc.dequeueOutputBuffer(info, 10_000L) }
+                              catch (_: Exception) { break }
+                    when {
+                        idx >= 0 -> {
+                            val buf = mc.getOutputBuffer(idx)
+                            if (buf != null && info.size > 0) {
+                                val data = ByteArray(info.size)
+                                buf.get(data)
+                                val isConfig   = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                when {
+                                    isConfig -> {
+                                        // Store SPS+PPS; don't send separately — will be
+                                        // prepended to every IDR so late-joining receivers work
+                                        codecConfigData = data
+                                        Log.i(TAG, "H264 codec config captured ${data.size}B")
+                                    }
+                                    isKeyFrame -> {
+                                        val config = codecConfigData
+                                        if (config == null) Log.w(TAG, "IDR frame with no SPS/PPS — stream will not decode")
+                                        sendH264Nal(if (config != null) config + data else data)
+                                    }
+                                    else -> sendH264Nal(data)
+                                }
+                            }
+                            mc.releaseOutputBuffer(idx, false)
+                        }
+                        idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val fmt = mc.outputFormat
+                            Log.i(TAG, "H264 format: $fmt")
+                            // Extract SPS/PPS from csd-0 + csd-1 (device may never emit
+                            // BUFFER_FLAG_CODEC_CONFIG, so this is the reliable path)
+                            try {
+                                val sps = fmt.getByteBuffer("csd-0")
+                                val pps = fmt.getByteBuffer("csd-1")
+                                if (sps != null && pps != null) {
+                                    val spsBytes = ByteArray(sps.remaining()).also { sps.get(it) }
+                                    val ppsBytes = ByteArray(pps.remaining()).also { pps.get(it) }
+                                    codecConfigData = spsBytes + ppsBytes
+                                    Log.i(TAG, "H264 SPS+PPS from csd: ${codecConfigData!!.size}B")
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Could not extract csd: $e")
+                            }
+                        }
+                    }
+                }
+            }.also { it.isDaemon = true; it.name = "h264-output"; it.start() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start H264 encoder", e)
+        }
+    }
+
+    private fun stopH264Encoder() {
+        h264OutputRunning = false
+        h264OutputThread?.join(500)
+        h264OutputThread = null
+        mediaCodec?.let { mc ->
+            try { mc.flush(); mc.stop(); mc.release() } catch (_: Exception) {}
+        }
+        mediaCodec = null
+        codecConfigData = null
+    }
+
+    private fun feedH264Frame(nv21: ByteArray, w: Int, h: Int) {
+        val mc = mediaCodec ?: run {
+            if (udpTarget != null && udpPipelineRunning) startH264Encoder(w, h)
+            return
+        }
+        val idx = mc.dequeueInputBuffer(0)
+        if (idx < 0) {
+            val dropped = h264DroppedFrames.incrementAndGet()
+            val submitted = h264SubmittedFrames.get()
+            if (dropped % 30 == 0) {
+                Log.w(TAG, "H264 encoder busy: dropped=$dropped submitted=$submitted (${100*dropped/(dropped+submitted+1)}% drop rate)")
+            }
+            return
+        }
+        val buf = mc.getInputBuffer(idx) ?: run { mc.queueInputBuffer(idx, 0, 0, 0, 0); return }
+        buf.clear()
+        // NV21 → NV12: Y plane is identical; UV plane swaps each V,U pair to U,V
+        val ySize = w * h
+        val nv12 = nv12ScratchBuffer?.takeIf { it.size == nv21.size }
+            ?: ByteArray(nv21.size).also { nv12ScratchBuffer = it }
+        System.arraycopy(nv21, 0, nv12, 0, ySize)
+        var i = ySize
+        while (i < nv21.size - 1) {
+            nv12[i]     = nv21[i + 1]  // U
+            nv12[i + 1] = nv21[i]      // V
+            i += 2
+        }
+        buf.put(nv12)
+        mc.queueInputBuffer(idx, 0, nv21.size, System.nanoTime() / 1000, 0)
+        h264SubmittedFrames.incrementAndGet()
+    }
+
+    private fun sendH264Nal(nal: ByteArray) {
+        val sock = udpSocket ?: return
+        val target = udpTarget ?: return
+        val totalChunks = (nal.size + UDP_CHUNK_SIZE - 1) / UDP_CHUNK_SIZE
+        val seq = udpFrameSeq.getAndIncrement()
+        val header = ByteArray(8)
+        header[0] = (seq shr 24).toByte(); header[1] = (seq shr 16).toByte()
+        header[2] = (seq shr 8).toByte();  header[3] = seq.toByte()
+        for (i in 0 until totalChunks) {
+            val start = i * UDP_CHUNK_SIZE
+            val end = minOf(start + UDP_CHUNK_SIZE, nal.size)
+            val chunk = ByteArray(8 + (end - start))
+            System.arraycopy(header, 0, chunk, 0, 4)
+            chunk[4] = (i shr 8).toByte(); chunk[5] = i.toByte()
+            chunk[6] = (totalChunks shr 8).toByte(); chunk[7] = totalChunks.toByte()
+            System.arraycopy(nal, start, chunk, 8, end - start)
+            try { sock.send(DatagramPacket(chunk, chunk.size, target)) } catch (_: Exception) { return }
+        }
+    }
+
     fun setShowUIControls(show: Boolean) {
         showUIControls = show
         // Show/hide all UI controls
@@ -533,18 +792,34 @@ class YOLOView @JvmOverloads constructor(
                     val cameraProvider = cameraProviderFuture.get()
 
                     previewUseCase = Preview.Builder()
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                         .build()
 
                     imageAnalysisUseCase = ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                        .setResolutionSelector(
+                            androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+                                .setAspectRatioStrategy(
+                                    androidx.camera.core.resolutionselector.AspectRatioStrategy(
+                                        AspectRatio.RATIO_16_9,
+                                        androidx.camera.core.resolutionselector.AspectRatioStrategy.FALLBACK_RULE_AUTO
+                                    )
+                                )
+                                .setResolutionStrategy(
+                                    androidx.camera.core.resolutionselector.ResolutionStrategy(
+                                        android.util.Size(1920, 1080),
+                                        androidx.camera.core.resolutionselector.ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER
+                                    )
+                                )
+                                .build()
+                        )
                         .build()
 
                     cameraExecutor = Executors.newSingleThreadExecutor()
                     imageAnalysisUseCase!!.setAnalyzer(cameraExecutor!!) { imageProxy ->
                         onFrame(imageProxy)
                     }
+                    startInferenceThread()
 
                     val cameraSelector = CameraSelector.Builder()
                         .requireLensFacing(lensFacing)
@@ -637,116 +912,57 @@ class YOLOView @JvmOverloads constructor(
     // region onFrame (per frame inference)
 
     private fun onFrame(imageProxy: ImageProxy) {
-        // Early return if view is stopped to prevent accessing closed resources
-        if (isStopped) {
-            imageProxy.close()
-            return
-        }
+        if (isStopped) { imageProxy.close(); return }
 
+        val frameStart = System.currentTimeMillis()
         val w = imageProxy.width
         val h = imageProxy.height
-        val orientation = context.resources.configuration.orientation
-        val isLandscapeDevice = orientation == Configuration.ORIENTATION_LANDSCAPE
-
-        val bitmap = ImageUtils.toBitmap(imageProxy) ?: run {
-            Log.e(TAG, "Failed to convert ImageProxy to Bitmap")
-            imageProxy.close()
-            return
+        val frameNum = cameraFrameCounter.incrementAndGet()
+        if (frameNum % 30 == 0) {
+            val now = System.currentTimeMillis()
+            val elapsed = now - cameraTickMs
+            val cameraFps = if (cameraTickMs > 0) (30_000.0 / elapsed).toInt() else 0
+            cameraTickMs = now
+            Log.i(TAG, "Camera fps≈$cameraFps  encoder submitted=${h264SubmittedFrames.get()} dropped=${h264DroppedFrames.get()}")
         }
 
-        // Check again after bitmap conversion (in case stop() was called during conversion)
-        if (isStopped) {
-            imageProxy.close()
-            return
-        }
+        val needNv21 = rtmpEnabled || udpTarget != null || predictor != null
+        val t0 = System.currentTimeMillis()
+        val nv21: ByteArray? = if (needNv21) {
+            try { ImageUtils.yuv420888ToNv21(imageProxy) } catch (_: Exception) { null }
+        } else null
+        val nv21Ms = System.currentTimeMillis() - t0
 
-        // NV21 export for RTMP streaming at ≤30fps
-        if (rtmpEnabled) {
+        // UDP path: H.264 hardware encoder — non-blocking, drops if encoder busy
+        val t1 = System.currentTimeMillis()
+        if (nv21 != null && udpTarget != null) {
+            feedH264Frame(nv21, w, h)
+        }
+        val udpMs = System.currentTimeMillis() - t1
+
+        // RTMP path: 33ms gate to avoid overwhelming FFmpeg
+        if (nv21 != null && rtmpEnabled) {
             val nowMs = System.currentTimeMillis()
             if (nowMs - lastRtmpMs >= 33) {
                 lastRtmpMs = nowMs
-                try {
-                    val nv21 = ImageUtils.yuv420888ToNv21(imageProxy)
-                    val fw = imageProxy.width
-                    val fh = imageProxy.height
-                    val cb = rtmpFrameCallback
-                    if (cb != null) mainHandler.post { cb(nv21, fw, fh) }
-                } catch (e: Exception) {}
+                val cb = rtmpFrameCallback
+                if (cb != null) mainHandler.post { cb(nv21, w, h) }
             }
         }
 
-        predictor?.let { p ->
-            // Double-check stopped flag before inference (predictor might be closed)
-            if (isStopped) {
-                imageProxy.close()
-                return
-            }
-
-            // Check if we should run inference on this frame
-            if (!shouldRunInference()) {
-                imageProxy.close()
-                return
-            }
-            
-            try {
-                // Get device orientation
-                val orientation = context.resources.configuration.orientation
-                val isLandscape = orientation == Configuration.ORIENTATION_LANDSCAPE
-                
-                // Check if using front camera
-                val isFrontCamera = lensFacing == CameraSelector.LENS_FACING_FRONT
-                
-                // Set camera facing information in predictor
-                (p as? BasePredictor)?.isFrontCamera = isFrontCamera
-                
-                // For camera feed, we typically rotate the bitmap
-                // In landscape mode, we don't rotate, so width/height should match actual bitmap dimensions
-                val result = if (isLandscape) {
-                    p.predict(bitmap, w, h, rotateForCamera = true, isLandscape = isLandscape)
-                } else {
-                    // In portrait mode, keep the original behavior (h, w)
-                    p.predict(bitmap, h, w, rotateForCamera = true, isLandscape = isLandscape)
-                }
-                
-                // Apply originalImage if streaming config requires it
-                val resultWithOriginalImage = if (streamConfig?.includeOriginalImage == true) {
-                    result.copy(originalImage = bitmap)  // Reuse bitmap from ImageProxy conversion
-                } else {
-                    result
-                }
-                
-                inferenceResult = resultWithOriginalImage
-
-                // Log
-                
-                // Callback
-                inferenceCallback?.invoke(resultWithOriginalImage)
-                
-                // Streaming callback (with output throttling)
-                streamCallback?.let { callback ->
-                    if (shouldProcessFrame()) {
-                        updateLastInferenceTime()
-                        
-                        // Convert to stream data and send
-                        val streamData = convertResultToStreamData(resultWithOriginalImage)
-                        // Add timestamp and frame info
-                        val enhancedStreamData = HashMap<String, Any>(streamData)
-                        enhancedStreamData["timestamp"] = System.currentTimeMillis()
-                        enhancedStreamData["frameNumber"] = frameNumberCounter++
-                        
-                        callback.invoke(enhancedStreamData)
-                    }
-                }
-
-                // Update overlay
-                post {
-                    overlayView.invalidate()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error during prediction", e)
-            }
+        // Submit raw NV21 to inference thread — bitmap is created inside the thread,
+        // not here, so the camera thread is not blocked by JPEG encode+decode.
+        val t2 = System.currentTimeMillis()
+        var inferencePushed = false
+        if (!isStopped && predictor != null && shouldRunInference() && nv21 != null) {
+            inferencePushed = inferenceQueue.offer(Triple(nv21, w, h))
         }
+        val inferEnqMs = System.currentTimeMillis() - t2
+
         imageProxy.close()
+
+        val totalMs = System.currentTimeMillis() - frameStart
+        Log.d(TAG, "onFrame ${w}x${h}: nv21=${nv21Ms}ms h264Feed=${udpMs}ms inferEnq=${inferEnqMs}ms total=${totalMs}ms yoloPushed=$inferencePushed")
     }
 
     // endregion
@@ -1008,7 +1224,7 @@ class YOLOView @JvmOverloads constructor(
 
                     // Segmentation mask
                     result.masks?.combinedMask?.let { maskBitmap ->
-                        val src = Rect(0, 0, maskBitmap.width, maskBitmap.height)
+                        val src = GraphicsRect(0, 0, maskBitmap.width, maskBitmap.height)
                         val dst = RectF(dx, dy, dx + scaledW, dy + scaledH)
                         val maskPaint = Paint().apply { alpha = 128 }
                         
@@ -1839,6 +2055,8 @@ class YOLOView @JvmOverloads constructor(
     fun stop() {
         // Set stopped flag first to prevent new frames from being processed
         isStopped = true
+        stopUdpPipeline()
+        stopInferenceThread()
 
         try {
             imageAnalysisUseCase?.clearAnalyzer()

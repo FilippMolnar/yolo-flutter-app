@@ -18,7 +18,12 @@ object ImageUtils {
     @JvmStatic
     fun toBitmap(imageProxy: ImageProxy): Bitmap? {
         val nv21 = yuv420888ToNv21(imageProxy)
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+        return toBitmapFromNv21(nv21, imageProxy.width, imageProxy.height)
+    }
+
+    @JvmStatic
+    fun toBitmapFromNv21(nv21: ByteArray, width: Int, height: Int): Bitmap? {
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         return yuvImageToBitmap(yuvImage)
     }
 
@@ -87,7 +92,7 @@ object ImageUtils {
         val out = ByteArrayOutputStream()
         val success = yuvImage.compressToJpeg(
             Rect(0, 0, yuvImage.width, yuvImage.height),
-            100,
+            85,
             out
         )
         if (!success) return null

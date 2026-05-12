@@ -134,4 +134,9 @@ class YOLOViewController {
       _invoke('setRtmpEnabled', {'enabled': enabled});
 
   Future<Uint8List?> captureFrame() => _invoke<Uint8List>('captureFrame');
+
+  Future<void> setUdpTarget(String host, int port, {int quality = 40}) =>
+      _invoke('setUdpTarget', {'host': host, 'port': port, 'quality': quality});
+
+  Future<void> clearUdpTarget() => _invoke('clearUdpTarget');
 }
