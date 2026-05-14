@@ -139,4 +139,25 @@ class YOLOViewController {
       _invoke('setUdpTarget', {'host': host, 'port': port, 'quality': quality});
 
   Future<void> clearUdpTarget() => _invoke('clearUdpTarget');
+
+  /// Called when Kotlin stops the recording unexpectedly (camera error, lifecycle interrupt).
+  /// Use this to reset the record button state in the UI.
+  void setOnRecordingStopped(void Function() callback) {
+    _methodChannel?.setMethodCallHandler((call) async {
+      if (call.method == 'onRecordingStopped') callback();
+    });
+  }
+
+  /// Returns {success: bool, filePath: String}. Kotlin manages the output file.
+  Future<Map<String, dynamic>?> startNativeRecording() async {
+    final raw = await _invoke<Map<Object?, Object?>>('startNativeRecording');
+    if (raw == null) return null;
+    return {
+      'success':  raw['success']  as bool?   ?? false,
+      'filePath': raw['filePath'] as String? ?? '',
+    };
+  }
+
+  /// Blocks until the video file is finalized. Returns the saved file path.
+  Future<String?> stopNativeRecording() => _invoke<String>('stopNativeRecording');
 }

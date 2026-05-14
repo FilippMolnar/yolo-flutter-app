@@ -141,6 +141,13 @@ class YOLOPlatformView(
                 }
             }
 
+            yoloView.onRecordingStoppedUnexpectedly = {
+                retryHandler.post {
+                    try { methodChannel?.invokeMethod("onRecordingStopped", null) }
+                    catch (e: Exception) {}
+                }
+            }
+
         } catch (e: Exception) {
             Log.e(TAG, "Error initializing YOLOPlatformView", e)
         }
@@ -474,6 +481,16 @@ class YOLOPlatformView(
                 "clearUdpTarget" -> {
                     yoloView.clearUdpTarget()
                     result.success(null)
+                }
+                "startNativeRecording" -> {
+                    result.success(yoloView.startNativeRecording())
+                }
+                "stopNativeRecording" -> {
+                    // stopNativeRecordingSync blocks for finalization — run on background thread.
+                    Thread {
+                        val path = yoloView.stopNativeRecordingSync()
+                        retryHandler.post { result.success(path) }
+                    }.also { it.isDaemon = true; it.name = "stop-recording"; it.start() }
                 }
                 else -> {
                     result.notImplemented()

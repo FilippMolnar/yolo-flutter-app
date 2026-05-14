@@ -33,6 +33,19 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.video.FallbackStrategy
 import android.graphics.YuvImage
 import android.graphics.Rect as GraphicsRect
 import kotlin.math.max
@@ -54,7 +67,10 @@ class YOLOView @JvmOverloads constructor(
 
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+        private val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+        )
         private var previewUseCase: Preview? = null
 
         private const val TAG = "YOLOView"
@@ -242,6 +258,17 @@ class YOLOView @JvmOverloads constructor(
     private val cameraFrameCounter = AtomicInteger(0)
     @Volatile private var cameraTickMs = 0L
 
+    // Native recording via VideoCapture<Recorder> — dedicated camera surface,
+    // independent of ImageAnalysis, no frame drops, hardware-correct timestamps.
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
+    @Volatile private var nativeRecordingFilePath: String? = null
+    @Volatile private var recordingFinalizeLatch: CountDownLatch? = null
+    @Volatile private var recordingStopRequested = false
+    var onRecordingStoppedUnexpectedly: (() -> Unit)? = null
+    @Volatile var lastFrameWidth: Int = 0
+    @Volatile var lastFrameHeight: Int = 0
+
     // Async inference — YOLO runs on its own thread so it doesn't block frame capture
     // Queue carries raw NV21 bytes so bitmap decoding happens off the camera thread
     private val inferenceQueue = ArrayBlockingQueue<Triple<ByteArray, Int, Int>>(1)
@@ -408,6 +435,62 @@ class YOLOView @JvmOverloads constructor(
 
     fun setRtmpEnabled(enabled: Boolean) { rtmpEnabled = enabled }
     fun setRtmpFrameCallback(cb: ((ByteArray, Int, Int) -> Unit)?) { rtmpFrameCallback = cb }
+
+    fun startNativeRecording(): Map<String, Any> {
+        stopNativeRecordingSync()
+        val vc = videoCapture ?: run {
+            Log.e(TAG, "startNativeRecording: videoCapture not ready")
+            return mapOf("success" to false, "filePath" to "")
+        }
+        val dir = context.getExternalFilesDir(null) ?: run {
+            Log.e(TAG, "startNativeRecording: no external storage")
+            return mapOf("success" to false, "filePath" to "")
+        }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val filePath = "${dir.absolutePath}/gymcam_$ts.mp4"
+        nativeRecordingFilePath = filePath
+
+        val latch = CountDownLatch(1)
+        recordingFinalizeLatch = latch
+
+        val outputOptions = FileOutputOptions.Builder(File(filePath)).build()
+        val hasAudio = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        var pending = vc.output.prepareRecording(context, outputOptions)
+        if (hasAudio) pending = pending.withAudioEnabled()
+        else Log.w(TAG, "RECORD_AUDIO not granted — recording without audio")
+        recordingStopRequested = false
+        activeRecording = pending
+            .start(Executors.newSingleThreadExecutor()) { event: VideoRecordEvent ->
+                if (event is VideoRecordEvent.Finalize) {
+                    val expected = recordingStopRequested
+                    if (event.hasError()) {
+                        Log.e(TAG, "Recording finalize error: code=${event.error} expected=$expected")
+                    }
+                    if (!expected) {
+                        // Camera session was interrupted (lifecycle, model reload, encoder error).
+                        // Notify Dart so the record button resets.
+                        mainHandler.post { onRecordingStoppedUnexpectedly?.invoke() }
+                    }
+                    latch.countDown()
+                }
+            }
+        Log.i(TAG, "startNativeRecording → $filePath")
+        return mapOf("success" to true, "filePath" to filePath)
+    }
+
+    // Blocking stop — must be called from a background thread.
+    fun stopNativeRecordingSync(): String? {
+        recordingStopRequested = true  // tell Finalize callback this was intentional
+        activeRecording?.stop()
+        activeRecording = null
+        recordingFinalizeLatch?.await(10, TimeUnit.SECONDS)
+        recordingFinalizeLatch = null
+        val path = nativeRecordingFilePath
+        nativeRecordingFilePath = null
+        Log.i(TAG, "stopNativeRecording → $path")
+        return path
+    }
 
     fun setUdpTarget(host: String, port: Int, quality: Int = 40) {
         udpTarget = InetSocketAddress(host, port)
@@ -791,6 +874,14 @@ class YOLOView @JvmOverloads constructor(
                 try {
                     val cameraProvider = cameraProviderFuture.get()
 
+                    // If recording is active, skip the full camera restart — unbindAll()
+                    // would terminate the VideoCapture session (ERROR_SOURCE_INACTIVE).
+                    // CameraX keeps the camera alive through lifecycle transitions automatically.
+                    if (activeRecording != null) {
+                        Log.w(TAG, "startCamera: recording in progress — skipping camera restart")
+                        return@addListener
+                    }
+
                     previewUseCase = Preview.Builder()
                         .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                         .build()
@@ -815,6 +906,15 @@ class YOLOView @JvmOverloads constructor(
                         )
                         .build()
 
+                    val recorder = Recorder.Builder()
+                        .setQualitySelector(QualitySelector.fromOrderedList(
+                            listOf(Quality.FHD, Quality.HD, Quality.SD),
+                            FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)
+                        ))
+                        .build()
+                    val vc = VideoCapture.withOutput(recorder)
+                    videoCapture = vc
+
                     cameraExecutor = Executors.newSingleThreadExecutor()
                     imageAnalysisUseCase!!.setAnalyzer(cameraExecutor!!) { imageProxy ->
                         onFrame(imageProxy)
@@ -838,7 +938,8 @@ class YOLOView @JvmOverloads constructor(
                             owner,
                             cameraSelector,
                             previewUseCase,
-                            imageAnalysisUseCase  // the field, not a local val
+                            imageAnalysisUseCase,
+                            vc
                         )
 
                         // Reset zoom to 1.0x when camera starts
@@ -917,6 +1018,8 @@ class YOLOView @JvmOverloads constructor(
         val frameStart = System.currentTimeMillis()
         val w = imageProxy.width
         val h = imageProxy.height
+        lastFrameWidth = w
+        lastFrameHeight = h
         val frameNum = cameraFrameCounter.incrementAndGet()
         if (frameNum % 30 == 0) {
             val now = System.currentTimeMillis()
