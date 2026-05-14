@@ -15,6 +15,12 @@ import android.widget.Toast
 import android.view.ScaleGestureDetector
 import androidx.camera.core.*
 import androidx.camera.core.Camera
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CameraCharacteristics
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
@@ -737,6 +743,26 @@ class YOLOView @JvmOverloads constructor(
             // Notify zoom change
             onZoomChanged?.invoke(currentZoomRatio)
         }
+    }
+
+    @OptIn(ExperimentalCamera2Interop::class)
+    fun setCropRegion(normLeft: Float, normTop: Float, normRight: Float, normBottom: Float) {
+        val cam = camera ?: return
+        val cam2Info = Camera2CameraInfo.from(cam.cameraInfo)
+        val sensorSize = cam2Info.getCameraCharacteristic(
+            CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
+        ) ?: return
+        val sW = sensorSize.width()
+        val sH = sensorSize.height()
+        val l = (normLeft   * sW).toInt().coerceIn(0, sW - 2)
+        val t = (normTop    * sH).toInt().coerceIn(0, sH - 2)
+        val r = (normRight  * sW).toInt().coerceIn(l + 1, sW)
+        val b = (normBottom * sH).toInt().coerceIn(t + 1, sH)
+        Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(
+            CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.SCALER_CROP_REGION, GraphicsRect(l, t, r, b))
+                .build()
+        )
     }
 
     fun setTorchMode(enabled: Boolean) {

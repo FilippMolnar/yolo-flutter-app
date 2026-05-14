@@ -60,6 +60,85 @@ class VideoCapture: NSObject, @unchecked Sendable {
 
   private var currentBuffer: CVPixelBuffer?
 
+  // Normalized crop region [0,1] applied before inference and encoding.
+  var cropLeft: CGFloat = 0.0
+  var cropTop: CGFloat = 0.0
+  var cropRight: CGFloat = 1.0
+  var cropBottom: CGFloat = 1.0
+  var cropEnabled = false
+
+  func setCropRegion(left: CGFloat, top: CGFloat, right: CGFloat, bottom: CGFloat) {
+    cropLeft = left; cropTop = top; cropRight = right; cropBottom = bottom
+    cropEnabled = left > 0.001 || top > 0.001 || right < 0.999 || bottom < 0.999
+  }
+
+  private func makeCroppedSampleBuffer(_ original: CMSampleBuffer) -> CMSampleBuffer? {
+    guard cropEnabled,
+      let pixelBuffer = CMSampleBufferGetImageBuffer(original)
+    else { return nil }
+
+    let srcW = CVPixelBufferGetWidth(pixelBuffer)
+    let srcH = CVPixelBufferGetHeight(pixelBuffer)
+    let x = Int(cropLeft * CGFloat(srcW)) & ~1
+    let y = Int(cropTop * CGFloat(srcH)) & ~1
+    let w = max(64, Int((cropRight - cropLeft) * CGFloat(srcW)) & ~1)
+    let h = max(64, Int((cropBottom - cropTop) * CGFloat(srcH)) & ~1)
+    let cx = max(0, min(x, srcW - w))
+    let cy = max(0, min(y, srcH - h))
+
+    let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
+    var croppedPB: CVPixelBuffer?
+    guard CVPixelBufferCreate(nil, w, h, fmt, nil, &croppedPB) == kCVReturnSuccess,
+      let dst = croppedPB
+    else { return nil }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    CVPixelBufferLockBaseAddress(dst, [])
+    defer {
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+      CVPixelBufferUnlockBaseAddress(dst, [])
+    }
+
+    let planeCount = CVPixelBufferGetPlaneCount(pixelBuffer)
+    if planeCount == 0 {
+      guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer),
+        let dstBase = CVPixelBufferGetBaseAddress(dst)
+      else { return nil }
+      let srcBPR = CVPixelBufferGetBytesPerRow(pixelBuffer)
+      let dstBPR = CVPixelBufferGetBytesPerRow(dst)
+      let bpp = srcBPR / srcW
+      for row in 0..<h {
+        memcpy(dstBase + row * dstBPR, srcBase + (cy + row) * srcBPR + cx * bpp, w * bpp)
+      }
+    } else {
+      for plane in 0..<planeCount {
+        let scale = plane == 0 ? 1 : 2
+        guard let srcBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane),
+          let dstBase = CVPixelBufferGetBaseAddressOfPlane(dst, plane)
+        else { continue }
+        let srcBPR = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane)
+        let dstBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
+        let pw = CVPixelBufferGetWidthOfPlane(dst, plane)
+        let ph = CVPixelBufferGetHeightOfPlane(dst, plane)
+        let bpp = srcBPR / (srcW / scale)
+        for row in 0..<ph {
+          memcpy(dstBase + row * dstBPR, srcBase + (cy/scale + row) * srcBPR + (cx/scale) * bpp, pw * bpp)
+        }
+      }
+    }
+
+    var timing = CMSampleTimingInfo()
+    CMSampleBufferGetSampleTimingInfo(original, at: 0, timingInfoOut: &timing)
+    var fmtDesc: CMFormatDescription?
+    CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: dst, formatDescriptionOut: &fmtDesc)
+    guard let fd = fmtDesc else { return nil }
+    var out: CMSampleBuffer?
+    CMSampleBufferCreateReadyWithImageBuffer(
+      allocator: nil, imageBuffer: dst, formatDescription: fd,
+      sampleTiming: &timing, sampleBufferOut: &out)
+    return out
+  }
+
   func setUp(
     sessionPreset: AVCaptureSession.Preset = .hd1280x720,
     position: AVCaptureDevice.Position,
@@ -304,7 +383,8 @@ extension VideoCapture: AVCaptureVideoDataOutputSampleBufferDelegate {
     from connection: AVCaptureConnection
   ) {
     guard inferenceOK else { return }
-    predictOnFrame(sampleBuffer: sampleBuffer)
+    let effective = makeCroppedSampleBuffer(sampleBuffer) ?? sampleBuffer
+    predictOnFrame(sampleBuffer: effective)
   }
 }
 

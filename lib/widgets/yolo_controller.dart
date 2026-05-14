@@ -92,6 +92,14 @@ class YOLOViewController {
   Future<void> setZoomLevel(double zoomLevel) =>
       _invoke('setZoomLevel', {'zoomLevel': zoomLevel});
 
+  Future<void> setCropRegion(double left, double top, double right, double bottom) =>
+      _invoke('setCropRegion', {
+        'left': left,
+        'top': top,
+        'right': right,
+        'bottom': bottom,
+      });
+
   Future<void> switchModel(String modelPath, [YOLOTask? task]) async {
     if (_methodChannel == null || _viewId == null) return;
     final resolvedModel = await YOLOModelResolver.resolve(

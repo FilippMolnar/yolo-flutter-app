@@ -357,6 +357,21 @@ public class SwiftYOLOPlatformView: NSObject, FlutterPlatformView, FlutterStream
               code: "invalid_args", message: "Invalid arguments for setZoomLevel", details: nil))
         }
 
+      case "setCropRegion":
+        if let args = call.arguments as? [String: Any],
+          let l = args["left"] as? Double,
+          let t = args["top"] as? Double,
+          let r = args["right"] as? Double,
+          let b = args["bottom"] as? Double
+        {
+          self.yoloView?.setCropRegion(CGFloat(l), CGFloat(t), CGFloat(r), CGFloat(b))
+          result(nil)
+        } else {
+          result(
+            FlutterError(
+              code: "invalid_args", message: "left/top/right/bottom required", details: nil))
+        }
+
       case "setStreamingConfig":
         // Method to update streaming configuration
         if let args = call.arguments as? [String: Any] {

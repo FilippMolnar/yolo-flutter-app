@@ -412,6 +412,18 @@ class YOLOPlatformView(
                         result.error("invalid_args", "zoomLevel is required", null)
                     }
                 }
+                "setCropRegion" -> {
+                    val left   = call.argument<Double>("left")?.toFloat()
+                    val top    = call.argument<Double>("top")?.toFloat()
+                    val right  = call.argument<Double>("right")?.toFloat()
+                    val bottom = call.argument<Double>("bottom")?.toFloat()
+                    if (left != null && top != null && right != null && bottom != null) {
+                        yoloView.setCropRegion(left, top, right, bottom)
+                        result.success(null)
+                    } else {
+                        result.error("invalid_args", "left/top/right/bottom required", null)
+                    }
+                }
                 "setStreamingConfig" -> {
                     // Parse streaming config from arguments
                     val configMap = call.arguments as? Map<*, *>

@@ -1214,6 +1214,10 @@ public class YOLOView: UIView, VideoCaptureDelegate {
     }
   }
 
+  public func setCropRegion(_ left: CGFloat, _ top: CGFloat, _ right: CGFloat, _ bottom: CGFloat) {
+    videoCapture.setCropRegion(left: left, top: top, right: right, bottom: bottom)
+  }
+
   public func setTorchMode(_ enabled: Bool) {
     guard let device = videoCapture.captureDevice, device.hasTorch else { return }
 
