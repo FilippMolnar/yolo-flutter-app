@@ -467,21 +467,6 @@ class YOLOPlatformView(
                     yoloView.setRtmpEnabled(enabled)
                     result.success(null)
                 }
-                "setUdpTarget" -> {
-                    val host = call.argument<String>("host")
-                    val port = call.argument<Int>("port")
-                    if (host == null || port == null) {
-                        result.error("invalid_args", "host and port required", null)
-                    } else {
-                        val quality = call.argument<Int>("quality") ?: 40
-                        yoloView.setUdpTarget(host, port, quality)
-                        result.success(null)
-                    }
-                }
-                "clearUdpTarget" -> {
-                    yoloView.clearUdpTarget()
-                    result.success(null)
-                }
                 "startNativeRecording" -> {
                     result.success(yoloView.startNativeRecording())
                 }

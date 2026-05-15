@@ -27,11 +27,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetSocketAddress
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
@@ -53,9 +49,6 @@ import kotlin.math.min
 import android.widget.TextView
 import android.view.Gravity
 import android.content.res.Configuration
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaFormat
 
 class YOLOView @JvmOverloads constructor(
     context: Context,
@@ -74,7 +67,6 @@ class YOLOView @JvmOverloads constructor(
         private var previewUseCase: Preview? = null
 
         private const val TAG = "YOLOView"
-        const val UDP_CHUNK_SIZE = 1400
 
         // Line thickness and corner radius
         private const val BOX_LINE_WIDTH = 8f
@@ -242,21 +234,6 @@ class YOLOView @JvmOverloads constructor(
     private var lastRtmpMs = 0L
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var rtmpFrameCallback: ((ByteArray, Int, Int) -> Unit)? = null
-
-    // UDP streaming — H.264 hardware-encoded via MediaCodec
-    @Volatile private var udpTarget: InetSocketAddress? = null
-    private var udpSocket: DatagramSocket? = null
-    private val udpFrameSeq = AtomicInteger(0)
-    @Volatile private var udpPipelineRunning = false
-    @Volatile private var mediaCodec: MediaCodec? = null
-    @Volatile private var h264OutputRunning = false
-    private var h264OutputThread: Thread? = null
-    @Volatile private var codecConfigData: ByteArray? = null  // SPS+PPS, prepended to every IDR
-    private var nv12ScratchBuffer: ByteArray? = null  // reused per-frame to avoid allocation
-    private val h264DroppedFrames = AtomicInteger(0)
-    private val h264SubmittedFrames = AtomicInteger(0)
-    private val cameraFrameCounter = AtomicInteger(0)
-    @Volatile private var cameraTickMs = 0L
 
     // Native recording via VideoCapture<Recorder> — dedicated camera surface,
     // independent of ImageAnalysis, no frame drops, hardware-correct timestamps.
@@ -492,22 +469,6 @@ class YOLOView @JvmOverloads constructor(
         return path
     }
 
-    fun setUdpTarget(host: String, port: Int, quality: Int = 40) {
-        udpTarget = InetSocketAddress(host, port)
-        if (!udpPipelineRunning) startUdpPipeline()
-    }
-
-    fun clearUdpTarget() {
-        udpTarget = null
-        stopUdpPipeline()
-    }
-
-    private fun startUdpPipeline() {
-        udpPipelineRunning = true
-        udpSocket = DatagramSocket()
-        // H.264 encoder is started lazily on first frame (dimensions needed)
-    }
-
     private fun startInferenceThread() {
         inferenceThreadRunning = true
         inferenceThread = Thread {
@@ -569,152 +530,6 @@ class YOLOView @JvmOverloads constructor(
         inferenceThread?.join(500)
         inferenceThread = null
         inferenceQueue.clear()
-    }
-
-    private fun stopUdpPipeline() {
-        udpPipelineRunning = false
-        stopH264Encoder()
-        udpSocket?.close()
-        udpSocket = null
-    }
-
-    private fun startH264Encoder(w: Int, h: Int) {
-        try {
-            val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
-                setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0)
-                setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
-            }
-            // Sync mode (no setCallback) so dequeueInputBuffer() works in feedH264Frame()
-            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            codec.start()
-            mediaCodec = codec
-            Log.i(TAG, "H264 hardware encoder started ${w}x${h}")
-
-            // Drain output on a dedicated thread
-            h264OutputRunning = true
-            h264OutputThread = Thread {
-                val info = MediaCodec.BufferInfo()
-                while (h264OutputRunning) {
-                    val mc = mediaCodec ?: break
-                    val idx = try { mc.dequeueOutputBuffer(info, 10_000L) }
-                              catch (_: Exception) { break }
-                    when {
-                        idx >= 0 -> {
-                            val buf = mc.getOutputBuffer(idx)
-                            if (buf != null && info.size > 0) {
-                                val data = ByteArray(info.size)
-                                buf.get(data)
-                                val isConfig   = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                                val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                                when {
-                                    isConfig -> {
-                                        // Store SPS+PPS; don't send separately — will be
-                                        // prepended to every IDR so late-joining receivers work
-                                        codecConfigData = data
-                                        Log.i(TAG, "H264 codec config captured ${data.size}B")
-                                    }
-                                    isKeyFrame -> {
-                                        val config = codecConfigData
-                                        if (config == null) Log.w(TAG, "IDR frame with no SPS/PPS — stream will not decode")
-                                        sendH264Nal(if (config != null) config + data else data)
-                                    }
-                                    else -> sendH264Nal(data)
-                                }
-                            }
-                            mc.releaseOutputBuffer(idx, false)
-                        }
-                        idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            val fmt = mc.outputFormat
-                            Log.i(TAG, "H264 format: $fmt")
-                            // Extract SPS/PPS from csd-0 + csd-1 (device may never emit
-                            // BUFFER_FLAG_CODEC_CONFIG, so this is the reliable path)
-                            try {
-                                val sps = fmt.getByteBuffer("csd-0")
-                                val pps = fmt.getByteBuffer("csd-1")
-                                if (sps != null && pps != null) {
-                                    val spsBytes = ByteArray(sps.remaining()).also { sps.get(it) }
-                                    val ppsBytes = ByteArray(pps.remaining()).also { pps.get(it) }
-                                    codecConfigData = spsBytes + ppsBytes
-                                    Log.i(TAG, "H264 SPS+PPS from csd: ${codecConfigData!!.size}B")
-                                }
-                            } catch (e: Exception) {
-                                Log.w(TAG, "Could not extract csd: $e")
-                            }
-                        }
-                    }
-                }
-            }.also { it.isDaemon = true; it.name = "h264-output"; it.start() }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to start H264 encoder", e)
-        }
-    }
-
-    private fun stopH264Encoder() {
-        h264OutputRunning = false
-        h264OutputThread?.join(500)
-        h264OutputThread = null
-        mediaCodec?.let { mc ->
-            try { mc.flush(); mc.stop(); mc.release() } catch (_: Exception) {}
-        }
-        mediaCodec = null
-        codecConfigData = null
-    }
-
-    private fun feedH264Frame(nv21: ByteArray, w: Int, h: Int) {
-        val mc = mediaCodec ?: run {
-            if (udpTarget != null && udpPipelineRunning) startH264Encoder(w, h)
-            return
-        }
-        val idx = mc.dequeueInputBuffer(0)
-        if (idx < 0) {
-            val dropped = h264DroppedFrames.incrementAndGet()
-            val submitted = h264SubmittedFrames.get()
-            if (dropped % 30 == 0) {
-                Log.w(TAG, "H264 encoder busy: dropped=$dropped submitted=$submitted (${100*dropped/(dropped+submitted+1)}% drop rate)")
-            }
-            return
-        }
-        val buf = mc.getInputBuffer(idx) ?: run { mc.queueInputBuffer(idx, 0, 0, 0, 0); return }
-        buf.clear()
-        // NV21 → NV12: Y plane is identical; UV plane swaps each V,U pair to U,V
-        val ySize = w * h
-        val nv12 = nv12ScratchBuffer?.takeIf { it.size == nv21.size }
-            ?: ByteArray(nv21.size).also { nv12ScratchBuffer = it }
-        System.arraycopy(nv21, 0, nv12, 0, ySize)
-        var i = ySize
-        while (i < nv21.size - 1) {
-            nv12[i]     = nv21[i + 1]  // U
-            nv12[i + 1] = nv21[i]      // V
-            i += 2
-        }
-        buf.put(nv12)
-        mc.queueInputBuffer(idx, 0, nv21.size, System.nanoTime() / 1000, 0)
-        h264SubmittedFrames.incrementAndGet()
-    }
-
-    private fun sendH264Nal(nal: ByteArray) {
-        val sock = udpSocket ?: return
-        val target = udpTarget ?: return
-        val totalChunks = (nal.size + UDP_CHUNK_SIZE - 1) / UDP_CHUNK_SIZE
-        val seq = udpFrameSeq.getAndIncrement()
-        val header = ByteArray(8)
-        header[0] = (seq shr 24).toByte(); header[1] = (seq shr 16).toByte()
-        header[2] = (seq shr 8).toByte();  header[3] = seq.toByte()
-        for (i in 0 until totalChunks) {
-            val start = i * UDP_CHUNK_SIZE
-            val end = minOf(start + UDP_CHUNK_SIZE, nal.size)
-            val chunk = ByteArray(8 + (end - start))
-            System.arraycopy(header, 0, chunk, 0, 4)
-            chunk[4] = (i shr 8).toByte(); chunk[5] = i.toByte()
-            chunk[6] = (totalChunks shr 8).toByte(); chunk[7] = totalChunks.toByte()
-            System.arraycopy(nal, start, chunk, 8, end - start)
-            try { sock.send(DatagramPacket(chunk, chunk.size, target)) } catch (_: Exception) { return }
-        }
     }
 
     fun setShowUIControls(show: Boolean) {
@@ -1020,28 +835,12 @@ class YOLOView @JvmOverloads constructor(
         val h = imageProxy.height
         lastFrameWidth = w
         lastFrameHeight = h
-        val frameNum = cameraFrameCounter.incrementAndGet()
-        if (frameNum % 30 == 0) {
-            val now = System.currentTimeMillis()
-            val elapsed = now - cameraTickMs
-            val cameraFps = if (cameraTickMs > 0) (30_000.0 / elapsed).toInt() else 0
-            cameraTickMs = now
-            Log.i(TAG, "Camera fps≈$cameraFps  encoder submitted=${h264SubmittedFrames.get()} dropped=${h264DroppedFrames.get()}")
-        }
-
-        val needNv21 = rtmpEnabled || udpTarget != null || predictor != null
+        val needNv21 = rtmpEnabled || predictor != null
         val t0 = System.currentTimeMillis()
         val nv21: ByteArray? = if (needNv21) {
             try { ImageUtils.yuv420888ToNv21(imageProxy) } catch (_: Exception) { null }
         } else null
         val nv21Ms = System.currentTimeMillis() - t0
-
-        // UDP path: H.264 hardware encoder — non-blocking, drops if encoder busy
-        val t1 = System.currentTimeMillis()
-        if (nv21 != null && udpTarget != null) {
-            feedH264Frame(nv21, w, h)
-        }
-        val udpMs = System.currentTimeMillis() - t1
 
         // RTMP path: 33ms gate to avoid overwhelming FFmpeg
         if (nv21 != null && rtmpEnabled) {
@@ -1065,7 +864,7 @@ class YOLOView @JvmOverloads constructor(
         imageProxy.close()
 
         val totalMs = System.currentTimeMillis() - frameStart
-        Log.d(TAG, "onFrame ${w}x${h}: nv21=${nv21Ms}ms h264Feed=${udpMs}ms inferEnq=${inferEnqMs}ms total=${totalMs}ms yoloPushed=$inferencePushed")
+        Log.d(TAG, "onFrame ${w}x${h}: nv21=${nv21Ms}ms inferEnq=${inferEnqMs}ms total=${totalMs}ms yoloPushed=$inferencePushed")
     }
 
     // endregion
@@ -2158,7 +1957,6 @@ class YOLOView @JvmOverloads constructor(
     fun stop() {
         // Set stopped flag first to prevent new frames from being processed
         isStopped = true
-        stopUdpPipeline()
         stopInferenceThread()
 
         try {

@@ -138,6 +138,9 @@ class YOLOViewController {
   Future<void> setUdpTarget(String host, int port, {int quality = 40}) =>
       _invoke('setUdpTarget', {'host': host, 'port': port, 'quality': quality});
 
+  Future<void> setUdpPreset(String preset) =>
+      _invoke('setUdpPreset', {'preset': preset});
+
   Future<void> clearUdpTarget() => _invoke('clearUdpTarget');
 
   /// Called when Kotlin stops the recording unexpectedly (camera error, lifecycle interrupt).
